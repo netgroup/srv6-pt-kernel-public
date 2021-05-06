@@ -212,6 +212,10 @@ static bool ip6_parse_tlv(bool hopbyhop,
 			}
 			padlen = 0;
 		}
+		/* A "func" callback can invalidate skb pointers. For this
+		 * reason, we have to reload the network header pointer again.
+		 */
+		nh = skb_network_header(skb);
 		off += optlen;
 		len -= optlen;
 	}
