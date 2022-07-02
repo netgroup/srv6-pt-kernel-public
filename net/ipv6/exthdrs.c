@@ -52,6 +52,7 @@
 #include <linux/ioam6.h>
 #include <net/ioam6.h>
 #include <net/dst_metadata.h>
+#include <net/ip6_hoppt.h>
 
 #include <linux/uaccess.h>
 
@@ -900,8 +901,14 @@ int __init ipv6_exthdrs_init(void)
 	if (ret)
 		goto out_destopt;
 
+	ret = ipv6_hoppt_init();
+	if (ret)
+		goto out_none;
+
 out:
 	return ret;
+out_none:
+	inet6_del_protocol(&nodata_protocol, IPPROTO_NONE);
 out_destopt:
 	inet6_del_protocol(&destopt_protocol, IPPROTO_DSTOPTS);
 out_rthdr:
@@ -911,6 +918,8 @@ out_rthdr:
 
 void ipv6_exthdrs_exit(void)
 {
+	ipv6_hoppt_exit();
+
 	inet6_del_protocol(&nodata_protocol, IPPROTO_NONE);
 	inet6_del_protocol(&destopt_protocol, IPPROTO_DSTOPTS);
 	inet6_del_protocol(&rthdr_protocol, IPPROTO_ROUTING);
