@@ -878,18 +878,6 @@ drop:
 	return err;
 }
 
-static struct sr6_tlv_ptss *get_srh_tlv_ptss(struct ipv6_sr_hdr *srh)
-{
-	int nsegs = (srh->first_segment + 1) << 4;
-
-	/* XXX: this is an hack... we NAIL the PT TLV just after the SID List
-	 * NB: get_and_validate_srh() has already performed the pskb_may_pull()
-	 * so we do not need to redo it again.
-	 */
-	return (struct sr6_tlv_ptss *)((unsigned char *)srh + sizeof(*srh) +
-				       nsegs);
-}
-
 static int seg6_end_b6_etf_build(struct seg6_local_lwt *slwt, const void *cfg,
 				 struct netlink_ext_ack *extack)
 {
@@ -905,56 +893,6 @@ static int seg6_end_b6_etf_build(struct seg6_local_lwt *slwt, const void *cfg,
 	}
 
 	return 0;
-}
-
-static void
-end_b6_etf_store_info(struct sr6_tlv_ptss *tlv, int label, int ifload)
-{
-	tlv->rinfo = htons(((label & 0x0fff) << 4) | (ifload & 0x000f));
-}
-
-static void
-end_b6_etf_store_timestamp(struct sr6_tlv_ptss *tlv, struct timespec64 *from)
-{
-	struct timespec_be32 {
-		__be32	tv_sec;
-		__be32	tv_nsec;
-	} *ts32;
-
-	ts32 = (struct timespec_be32 *)&tlv->timestamp;
-
-	ts32->tv_nsec = cpu_to_be32((__u32)from->tv_nsec);
-	ts32->tv_sec = cpu_to_be32((__u32)from->tv_sec);
-}
-
-static void
-end_b6_etf_record_info(struct sr6_tlv_ptss *tlv, int label, int ifload,
-		       struct timespec64 *ts)
-{
-	end_b6_etf_store_info(tlv, label, ifload);
-	end_b6_etf_store_timestamp(tlv, ts);
-}
-
-static int end_b6_etf_ingress_ifindex(struct net *net, struct sk_buff *skb)
-{
-	bool l3_slave = ipv6_l3mdev_skb(IP6CB(skb)->flags);
-	struct net_device *orig_dev;
-	int iif;
-
-	/* take care of VRFs */
-	iif = l3_slave ? IP6CB(skb)->iif : skb->skb_iif;
-
-	/* check if net device "iif" exists or not */
-	orig_dev = dev_get_by_index_rcu(net, iif);
-	if (unlikely(!orig_dev))
-		return -ENODEV;
-
-	return iif;
-}
-
-static void end_b6_etf_get_timespec64(struct timespec64 *ts)
-{
-	*ts = ktime_to_timespec64(ktime_get_real());
 }
 
 static int input_action_end_b6_etf(struct sk_buff *skb,
@@ -974,7 +912,7 @@ static int input_action_end_b6_etf(struct sk_buff *skb,
 	if (!srh)
 		goto drop;
 
-	iif = end_b6_etf_ingress_ifindex(net, skb);
+	iif = ipv6_hoppt_iifindex(net, skb);
 	if (unlikely(iif < 0))
 		goto drop;
 
@@ -1000,9 +938,9 @@ static int input_action_end_b6_etf(struct sk_buff *skb,
 	/* tlv has been already validated during behavior setup */
 	tlv = get_srh_tlv_ptss(srh);
 
-	end_b6_etf_get_timespec64(&ts);
+	ipv6_hoppt_get_timespec64(&ts);
 
-	end_b6_etf_record_info(tlv, label, ifload, &ts);
+	ipv6_hoppt_tlv_ptss_update(tlv, label, ifload, &ts);
 
 out:
 	ipv6_hdr(skb)->payload_len = htons(skb->len - sizeof(struct ipv6hdr));

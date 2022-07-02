@@ -12,7 +12,7 @@
 #include <linux/hashtable.h>
 #include <linux/mutex.h>
 
-#include <linux/seg6.h>
+#include <net/seg6.h>
 
 #if defined(CONFIG_NETFILTER)
 #include <linux/netfilter.h>
@@ -82,7 +82,13 @@ struct ipv6_hoppt_map {
 	u32 elements;
 };
 
+/* contiain the interface used to receive the incoming packet */
+struct ipv6_hoppt_tgrcv {
+	int ifindex;
+};
+
 struct ipv6_hoppt_netns {
+	struct ipv6_hoppt_tgrcv tgrcv;
 	struct ipv6_hoppt_map hmap;
 };
 
@@ -96,6 +102,19 @@ static struct ipv6_hoppt_map *ipv6_hoppt_pernet_map(struct net *net)
 	struct ipv6_hoppt_netns *pt_netns = ipv6_hoppt_pernet(net);
 
 	return &pt_netns->hmap;
+}
+
+static struct ipv6_hoppt_tgrcv *ipv6_hoppt_pernet_tgrcv(struct net *net)
+{
+	struct ipv6_hoppt_netns *pt_netns = ipv6_hoppt_pernet(net);
+
+	return &pt_netns->tgrcv;
+}
+
+static void ipv6_hoppt_tgrcv_init(struct ipv6_hoppt_tgrcv *tgrcv)
+{
+	/* by default we do not have any generator incoming interface */
+	tgrcv->ifindex = -1;
 }
 
 static void ipv6_hoppt_map_init(struct ipv6_hoppt_map *hmap)
@@ -194,6 +213,141 @@ static void ipv6_hoppt_map_elem_free_rcu(struct ipv6_hoppt_map_elem *me)
 	kfree_rcu(me, rcu);
 }
 
+int ipv6_hoppt_iifindex(struct net *net, struct sk_buff *skb)
+{
+	bool l3_slave = ipv6_l3mdev_skb(IP6CB(skb)->flags);
+	struct net_device *orig_dev;
+	int iif;
+
+	/* take care of VRFs */
+	iif = l3_slave ? IP6CB(skb)->iif : skb->skb_iif;
+
+	/* check if net device "iif" exists or not */
+	orig_dev = dev_get_by_index_rcu(net, iif);
+	if (unlikely(!orig_dev))
+		return -ENODEV;
+
+	return iif;
+}
+
+static int __ipv6_hoppt_tgrcv_get_iface(struct net *net)
+{
+	struct ipv6_hoppt_tgrcv *tgrcv = ipv6_hoppt_pernet_tgrcv(net);
+
+	return READ_ONCE(tgrcv->ifindex);
+}
+
+/* check whether the packet is received on a generator interface or not */
+static bool ipv6_hoppt_tgrcv_iface(struct net *net, struct sk_buff *skb)
+{
+	int tgrcv_iif = __ipv6_hoppt_tgrcv_get_iface(net);
+	int iif = ipv6_hoppt_iifindex(net, skb);
+
+	if (tgrcv_iif < 0)
+		/* the generator interface is not set */
+		return false;
+
+	return iif == tgrcv_iif;
+}
+
+int seg6_find_tlv(const struct ipv6_sr_hdr *srh, int type)
+{
+	int srhlen = ipv6_optlen(srh);
+	struct sr6_tlv *tlv;
+	int tlv_offset;
+	int tlv_type;
+	int tlv_len;
+	int len;
+
+	tlv_offset = sizeof(*srh) + ((srh->first_segment + 1) << 4);
+	len = srhlen - tlv_offset;
+
+	while (len > 0) {
+		if (unlikely(len < sizeof(*tlv)))
+			goto bad;
+
+		tlv = (struct sr6_tlv *)((unsigned char *)srh + tlv_offset);
+		tlv_type = tlv->type;
+
+		if (tlv_type == type)
+			return tlv_offset;
+
+		switch (tlv_type) {
+		case IPV6_TLV_PAD1:
+			tlv_len = 1;
+			break;
+		default:
+			tlv_len = sizeof(*tlv) + tlv->len;
+			if (tlv_len > len)
+				goto bad;
+			break;
+		}
+
+		tlv_offset += tlv_len;
+		len -= tlv_len;
+	}
+	/* not_found */
+ bad:
+	return -1;
+}
+
+struct sr6_tlv_ptss *get_srh_tlv_ptss(const struct ipv6_sr_hdr *srh)
+{
+	struct sr6_tlv_ptss *tlv;
+	int tlv_offset;
+
+	tlv_offset = seg6_find_tlv(srh, SR6_TLV_PTSS);
+	if (unlikely(tlv_offset < 0))
+		return NULL;
+
+	tlv = (struct sr6_tlv_ptss *)((unsigned char *)srh + tlv_offset);
+	if (tlv->sr6_tlv_ptss_type != SR6_TLV_PTSS ||
+	    tlv->sr6_tlv_ptss_len != (sizeof(*tlv) -
+				      offsetof(struct sr6_tlv_ptss, tlv_data)))
+		return NULL;
+
+	return tlv;
+}
+
+static __be16 ipv6_hoppt_htons_ifinfo(int iflabel, int ifload)
+{
+	return htons(((iflabel & 0x0fff) << 4) | (0x000f & ifload));
+}
+
+static void
+ipv6_hoppt_tlv_ptss_store_info(struct sr6_tlv_ptss *tlv, int iflabel,
+			       int ifload)
+{
+	tlv->rinfo = ipv6_hoppt_htons_ifinfo(iflabel, ifload);
+}
+
+static void
+ipv6_hoppt_tlv_ptss_store_timestamp(struct sr6_tlv_ptss *tlv,
+				    struct timespec64 *from)
+{
+	struct timespec_be32 {
+		__be32	tv_sec;
+		__be32	tv_nsec;
+	} *ts32;
+
+	ts32 = (struct timespec_be32 *)&tlv->timestamp;
+
+	ts32->tv_nsec = cpu_to_be32((__u32)from->tv_nsec);
+	ts32->tv_sec = cpu_to_be32((__u32)from->tv_sec);
+}
+
+void ipv6_hoppt_get_timespec64(struct timespec64 *ts)
+{
+	*ts = ktime_to_timespec64(ktime_get_real());
+}
+
+void ipv6_hoppt_tlv_ptss_update(struct sr6_tlv_ptss *tlv, int label, int ifload,
+				struct timespec64 *ts)
+{
+	ipv6_hoppt_tlv_ptss_store_info(tlv, label, ifload);
+	ipv6_hoppt_tlv_ptss_store_timestamp(tlv, ts);
+}
+
 #if defined(CONFIG_NETFILTER)
 static u8 ipv6_hoppt_mpt_eval_tts(struct ipv6_hoppt_map_elem *me)
 {
@@ -208,7 +362,7 @@ static u8 ipv6_hoppt_mpt_eval_tts(struct ipv6_hoppt_map_elem *me)
 }
 
 static void ipv6_hoppt_tlv_ptmpt_record_mcd(struct sr6_ptmpt_mcd *mcd, u8 tts,
-					    int label, int ifload)
+					    int iflabel, int ifload)
 {
 	struct sr6_ptmpt_mcd *top = &mcd[0];
 
@@ -217,7 +371,7 @@ static void ipv6_hoppt_tlv_ptmpt_record_mcd(struct sr6_ptmpt_mcd *mcd, u8 tts,
 		sizeof(struct sr6_ptmpt_mcd) * (SR6_TLV_PTMPT_MCD_MAX - 1));
 
 	top->tts = tts;
-	top->rinfo = htons(((label & 0x0fff) << 4) | (0x000f & ifload));
+	top->rinfo = ipv6_hoppt_htons_ifinfo(iflabel, ifload);
 }
 
 static struct sr6_ptmpt_mcd *
@@ -226,11 +380,10 @@ ipv6_hoppt_tlv_ptmpt_mcds(struct sr6_tlv_ptmpt *tlv)
 	return &tlv->mcds[0];
 }
 
-static bool ipv6_hoppt_mpt(struct sk_buff *skb, int optoff)
+static bool ipv6_hoppt_mpt(struct net *net, struct sk_buff *skb, int optoff)
 {
 	unsigned char *nh = skb_network_header(skb);
 	struct net_device *odev = skb->dev;
-	struct net *net = dev_net(odev);
 	struct ipv6_hoppt_map_elem *me;
 	struct ipv6_hoppt_map *hmap;
 	struct sr6_ptmpt_mcd *mcds;
@@ -251,9 +404,7 @@ static bool ipv6_hoppt_mpt(struct sk_buff *skb, int optoff)
 
 	/* from now on, we can only go to commit */
 	label = me->label;
-
 	tts = ipv6_hoppt_mpt_eval_tts(me);
-
 	mcds = ipv6_hoppt_tlv_ptmpt_mcds(tlv);
 
 	ipv6_hoppt_tlv_ptmpt_record_mcd(mcds, tts, label, ifload);
@@ -269,6 +420,58 @@ drop:
 	return false;
 }
 
+static bool ipv6_hoppt_srcpt(struct net *net, struct sk_buff *skb)
+{
+	struct net_device *odev = skb->dev;
+	struct sr6_tlv_ptss *tlv;
+	struct ipv6_sr_hdr *srh;
+	int oif = odev->ifindex;
+	struct timespec64 ts;
+	const int ifload = 0;		/* not implemented yet */
+	int iflabel;
+
+	iflabel = ipv6_hoppt_label_lookup_rcu(net, oif);
+	if (iflabel < 0)
+		/* no Path-Tracing (PT) ID (label) set for the outgoing dev.
+		 * We return immediately without any further PT processing.
+		 */
+		return true;
+
+	srh = seg6_get_srh(skb, 0);
+	if (unlikely(!srh))
+		goto drop;
+
+	tlv = get_srh_tlv_ptss(srh);
+	if (unlikely(!tlv))
+		goto drop;
+
+	ipv6_hoppt_get_timespec64(&ts);
+
+	ipv6_hoppt_tlv_ptss_update(tlv, iflabel, ifload, &ts);
+
+	if (net_ratelimit())
+		pr_debug("IPv6 Hop-by-Hop PT: Source trace [oif=%d/ID=%d]\n",
+			 oif, iflabel);
+	return true;
+
+drop:
+	kfree_skb(skb);
+	return false;
+}
+
+static bool ipv6_hoppt_core(struct sk_buff *skb, int optoff)
+{
+	struct net_device *odev = skb->dev;
+	struct net *net = dev_net(odev);
+	bool src_node;
+
+	src_node = ipv6_hoppt_tgrcv_iface(net, skb);
+	if (src_node)
+		return ipv6_hoppt_srcpt(net, skb);
+
+	return ipv6_hoppt_mpt(net, skb, optoff);
+}
+
 struct tlvtype_proc {
 	int	type;
 	bool	(*func)(struct sk_buff *skb, int offset);
@@ -277,7 +480,7 @@ struct tlvtype_proc {
 static const struct tlvtype_proc tlvprochopopt_lst[] = {
 	{
 		.type	= SRV6_TLV_HOPPT,
-		.func	= ipv6_hoppt_mpt,
+		.func	= ipv6_hoppt_core,
 	},
 	{ -1, NULL },
 };
@@ -455,6 +658,156 @@ struct nla_policy ipv6_hoppt_genl_policy[IPV6_HOPPT_ATTR_MAX + 1] = {
 	[IPV6_HOPPT_ATTR_IFINDEX]	= { .type = NLA_S32, },
 	[IPV6_HOPPT_ATTR_TTSTMPL]	= { .type = NLA_S32, },
 };
+
+static int ipv6_hoppt_add_tgrcv_iface(struct net *net, int ifindex)
+{
+	struct ipv6_hoppt_tgrcv *tgrcv = ipv6_hoppt_pernet_tgrcv(net);
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+
+	dev = __dev_get_by_index(net, ifindex);
+	if (!dev)
+		return -ENODEV;
+
+	if (cmpxchg(&tgrcv->ifindex, -1, ifindex) != -1)
+		return -EEXIST;
+
+	pr_debug("IPv6 Hop-by-Hop PT: add TG rcv port ifindex=%d\n",
+		 ifindex);
+
+	return 0;
+}
+
+static int ipv6_hoppt_del_tgrcv_iface(struct net *net, int ifindex)
+{
+	struct ipv6_hoppt_tgrcv *tgrcv = ipv6_hoppt_pernet_tgrcv(net);
+
+	ASSERT_RTNL();
+
+	if (cmpxchg(&tgrcv->ifindex, ifindex, -1) != ifindex)
+		return -ENOENT;
+
+	pr_debug("IPv6 Hop-by-Hop PT: del TG rcv port ifindex=%d\n",
+		 ifindex);
+
+	return 0;
+}
+
+static int ipv6_hoppt_genl_add_tgrcv_iface(struct sk_buff *unused,
+					   struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+	struct nlattr **attrs;
+	int ifindex;
+	int rc;
+
+	attrs = info->attrs;
+	if (!attrs)
+		return -EINVAL;
+
+	if (!attrs[IPV6_HOPPT_ATTR_IFINDEX])
+		return -EINVAL;
+
+	ifindex = nla_get_s32(attrs[IPV6_HOPPT_ATTR_IFINDEX]);
+	if (ifindex < 0)
+		return -EINVAL;
+
+	rtnl_lock();
+	rc = ipv6_hoppt_add_tgrcv_iface(net, ifindex);
+	rtnl_unlock();
+
+	return rc;
+}
+
+static int ipv6_hoppt_genl_del_tgrcv_iface(struct sk_buff *unused,
+					   struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+	struct nlattr **attrs;
+	int ifindex;
+	int rc;
+
+	attrs = info->attrs;
+	if (!attrs)
+		return -EINVAL;
+
+	if (!attrs[IPV6_HOPPT_ATTR_IFINDEX])
+		return -EINVAL;
+
+	ifindex = nla_get_s32(attrs[IPV6_HOPPT_ATTR_IFINDEX]);
+	if (ifindex < 0)
+		return -EINVAL;
+
+	rtnl_lock();
+	rc = ipv6_hoppt_del_tgrcv_iface(net, ifindex);
+	rtnl_unlock();
+
+	return rc;
+}
+
+static int
+__ipv6_hoppt_genl_tgrcv_dump_iface(struct sk_buff *skb, u32 portid, u32 seq,
+				   u32 flags, u8 mcd, int ifindex)
+{
+	void *hdr;
+
+	hdr = genlmsg_put(skb, portid, seq, &ipv6_hoppt_genl_family, flags,
+			  mcd);
+	if (!hdr)
+		return -ENOMEM;
+
+	if (nla_put_s32(skb, IPV6_HOPPT_ATTR_IFINDEX, ifindex))
+		goto nla_put_failure;
+
+	genlmsg_end(skb, hdr);
+	return 0;
+
+nla_put_failure:
+	genlmsg_cancel(skb, hdr);
+	return -EMSGSIZE;
+}
+
+static int ipv6_hoppt_genl_show_tgrcv_iface(struct sk_buff *unused,
+					    struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+	struct sk_buff *msg;
+	int ifindex;
+	int rc;
+
+	/* we can build the reply message (prealloc sk_buff) */
+	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	rtnl_lock();
+
+	ifindex = __ipv6_hoppt_tgrcv_get_iface(net);
+	if (ifindex < 0) {
+		rc = -ENOENT;
+		goto error;
+	}
+
+	rc = __ipv6_hoppt_genl_tgrcv_dump_iface(msg, info->snd_portid,
+						info->snd_seq, 0,
+						IPV6_HOPPT_CMD_TGRCV_DUMP_ID,
+						ifindex);
+	if (rc)
+		goto error;
+
+	pr_debug("IPv6 Hop-by-Hop PT: show TG rcv port ifindex=%d\n", ifindex);
+
+	rtnl_unlock();
+
+	return genlmsg_reply(msg, info);
+
+error:
+	rtnl_unlock();
+
+	nlmsg_free(msg);
+	return rc;
+}
 
 static void __ipv6_hoppt_del_label(struct net *net,
 				   struct ipv6_hoppt_map_elem *me)
@@ -794,6 +1147,7 @@ static int ipv6_hoppt_device_event(struct notifier_block *unused,
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
+	int ifindex = dev->ifindex;
 
 	switch (event) {
 	case NETDEV_UNREGISTER:
@@ -807,7 +1161,9 @@ static int ipv6_hoppt_device_event(struct notifier_block *unused,
 		 * in the map and subsequent calls to the
 		 * ipv6_hoppt_del_label() return immediately.
 		 */
-		ipv6_hoppt_del_label(net, dev->ifindex);
+		ipv6_hoppt_del_label(net, ifindex);
+
+		ipv6_hoppt_del_tgrcv_iface(net, ifindex);
 		break;
 	}
 
@@ -849,6 +1205,28 @@ static const struct genl_ops ipv6_hoppt_genl_ops[] = {
 		.done		= ipv6_hoppt_genl_dump_labels_done,
 		.flags		= GENL_ADMIN_PERM,
 	},
+	{
+		.cmd		= IPV6_HOPPT_CMD_TGRCV_ADD_ID,
+		.validate	= GENL_DONT_VALIDATE_STRICT |
+				  GENL_DONT_VALIDATE_DUMP,
+		.doit		= ipv6_hoppt_genl_add_tgrcv_iface,
+		.flags		= GENL_ADMIN_PERM,
+	},
+	{
+		.cmd		= IPV6_HOPPT_CMD_TGRCV_DEL_ID,
+		.validate	= GENL_DONT_VALIDATE_STRICT |
+				  GENL_DONT_VALIDATE_DUMP,
+		.doit		= ipv6_hoppt_genl_del_tgrcv_iface,
+		.flags		= GENL_ADMIN_PERM,
+	},
+	{
+		.cmd		= IPV6_HOPPT_CMD_TGRCV_DUMP_ID,
+		.validate	= GENL_DONT_VALIDATE_STRICT |
+				  GENL_DONT_VALIDATE_DUMP,
+		.doit		= ipv6_hoppt_genl_show_tgrcv_iface,
+		.flags		= GENL_ADMIN_PERM,
+	},
+
 };
 
 static struct genl_family ipv6_hoppt_genl_family __ro_after_init = {
@@ -875,6 +1253,7 @@ static const struct nf_hook_ops ipv6_hoppt_tn_ops = {
 
 static int __net_init ipv6_hoppt_netns_init(struct net *net)
 {
+	struct ipv6_hoppt_tgrcv *tgrcv = ipv6_hoppt_pernet_tgrcv(net);
 	struct ipv6_hoppt_map *hmap = ipv6_hoppt_pernet_map(net);
 #if defined(CONFIG_NETFILTER)
 	int rc = nf_register_net_hook(net, &ipv6_hoppt_tn_ops);
@@ -883,6 +1262,7 @@ static int __net_init ipv6_hoppt_netns_init(struct net *net)
 		return rc;
 #endif
 
+	ipv6_hoppt_tgrcv_init(tgrcv);
 	ipv6_hoppt_map_init(hmap);
 
 	return 0;
