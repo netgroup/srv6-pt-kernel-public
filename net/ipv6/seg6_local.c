@@ -33,6 +33,8 @@
 #include <linux/bpf.h>
 #include <linux/netfilter.h>
 
+#include <net/ip6_hoppt.h>
+
 #define SEG6_F_ATTR(i)		BIT(i)
 
 struct seg6_local_lwt;
@@ -167,19 +169,9 @@ static struct ipv6_sr_hdr *get_and_validate_srh(struct sk_buff *skb)
 	return srh;
 }
 
-static bool decap_and_validate(struct sk_buff *skb, int proto)
+static bool decap(struct sk_buff *skb, int proto)
 {
-	struct ipv6_sr_hdr *srh;
 	unsigned int off = 0;
-
-	srh = seg6_get_srh(skb, 0);
-	if (srh && srh->segments_left > 0)
-		return false;
-
-#ifdef CONFIG_IPV6_SEG6_HMAC
-	if (srh && !seg6_hmac_validate_skb(skb))
-		return false;
-#endif
 
 	if (ipv6_find_hdr(skb, &off, proto, NULL, NULL) < 0)
 		return false;
@@ -195,6 +187,22 @@ static bool decap_and_validate(struct sk_buff *skb, int proto)
 		return false;
 
 	return true;
+}
+
+static bool decap_and_validate(struct sk_buff *skb, int proto)
+{
+	struct ipv6_sr_hdr *srh;
+
+	srh = seg6_get_srh(skb, 0);
+	if (srh && srh->segments_left > 0)
+		return false;
+
+#ifdef CONFIG_IPV6_SEG6_HMAC
+	if (srh && !seg6_hmac_validate_skb(skb))
+		return false;
+#endif
+
+	return decap(skb, proto);
 }
 
 static void advance_nextseg(struct ipv6_sr_hdr *srh, struct in6_addr *daddr)
@@ -870,6 +878,145 @@ drop:
 	return err;
 }
 
+static struct sr6_tlv_ptss *get_srh_tlv_ptss(struct ipv6_sr_hdr *srh)
+{
+	int nsegs = (srh->first_segment + 1) << 4;
+
+	/* XXX: this is an hack... we NAIL the PT TLV just after the SID List
+	 * NB: get_and_validate_srh() has already performed the pskb_may_pull()
+	 * so we do not need to redo it again.
+	 */
+	return (struct sr6_tlv_ptss *)((unsigned char *)srh + sizeof(*srh) +
+				       nsegs);
+}
+
+static int seg6_end_b6_etf_build(struct seg6_local_lwt *slwt, const void *cfg,
+				 struct netlink_ext_ack *extack)
+{
+	const struct sr6_tlv_ptss *tlv = get_srh_tlv_ptss(slwt->srh);
+
+	/* sanity checks */
+	if (tlv->sr6_tlv_ptss_type != SR6_TLV_PTSS ||
+	    tlv->sr6_tlv_ptss_len != (sizeof(*tlv) -
+				      offsetof(struct sr6_tlv_ptss,
+					       tlv_data))) {
+		NL_SET_ERR_MSG(extack, "Invalid SRH PT TLV header type/len");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void
+end_b6_etf_store_info(struct sr6_tlv_ptss *tlv, int label, int ifload)
+{
+	tlv->rinfo = htons(((label & 0x0fff) << 4) | (ifload & 0x000f));
+}
+
+static void
+end_b6_etf_store_timestamp(struct sr6_tlv_ptss *tlv, struct timespec64 *from)
+{
+	struct timespec_be32 {
+		__be32	tv_sec;
+		__be32	tv_nsec;
+	} *ts32;
+
+	ts32 = (struct timespec_be32 *)&tlv->timestamp;
+
+	ts32->tv_nsec = cpu_to_be32((__u32)from->tv_nsec);
+	ts32->tv_sec = cpu_to_be32((__u32)from->tv_sec);
+}
+
+static void
+end_b6_etf_record_info(struct sr6_tlv_ptss *tlv, int label, int ifload,
+		       struct timespec64 *ts)
+{
+	end_b6_etf_store_info(tlv, label, ifload);
+	end_b6_etf_store_timestamp(tlv, ts);
+}
+
+static int end_b6_etf_ingress_ifindex(struct net *net, struct sk_buff *skb)
+{
+	bool l3_slave = ipv6_l3mdev_skb(IP6CB(skb)->flags);
+	struct net_device *orig_dev;
+	int iif;
+
+	/* take care of VRFs */
+	iif = l3_slave ? IP6CB(skb)->iif : skb->skb_iif;
+
+	/* check if net device "iif" exists or not */
+	orig_dev = dev_get_by_index_rcu(net, iif);
+	if (unlikely(!orig_dev))
+		return -ENODEV;
+
+	return iif;
+}
+
+static void end_b6_etf_get_timespec64(struct timespec64 *ts)
+{
+	*ts = ktime_to_timespec64(ktime_get_real());
+}
+
+static int input_action_end_b6_etf(struct sk_buff *skb,
+				   struct seg6_local_lwt *slwt)
+{
+	struct net *net = dev_net(skb->dev);
+	struct sr6_tlv_ptss *tlv;
+	struct ipv6_sr_hdr *srh;
+	struct timespec64 ts;
+	int err = -EINVAL;
+	int ifload = 0;		/*XXX: not implemented yet */
+	int label;
+	int iif;
+
+	/* get the outermost SRH without caring if the SL == 0 */
+	srh = seg6_get_srh(skb, 0);
+	if (!srh)
+		goto drop;
+
+	iif = end_b6_etf_ingress_ifindex(net, skb);
+	if (unlikely(iif < 0))
+		goto drop;
+
+	if (srh->segments_left > 0)
+		advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
+
+	skb_reset_inner_headers(skb);
+	skb->encapsulation = 1;
+
+	err = seg6_do_srh_encap(skb, slwt->srh, IPPROTO_IPV6);
+	if (err)
+		goto drop;
+
+	/* we need to get the reference to the new (outer) SRH */
+	srh = seg6_get_srh(skb, 0);
+	if (unlikely(!srh))
+		goto drop;
+
+	label = ipv6_hoppt_label_lookup_rcu(net, iif);
+	if (label < 0)
+		goto out;
+
+	/* tlv has been already validated during behavior setup */
+	tlv = get_srh_tlv_ptss(srh);
+
+	end_b6_etf_get_timespec64(&ts);
+
+	end_b6_etf_record_info(tlv, label, ifload, &ts);
+
+out:
+	ipv6_hdr(skb)->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
+
+	seg6_lookup_nexthop(skb, NULL, 0);
+
+	return dst_input(skb);
+
+drop:
+	kfree_skb(skb);
+	return err;
+}
+
 DEFINE_PER_CPU(struct seg6_bpf_srh_state, seg6_bpf_srh_states);
 
 bool seg6_bpf_has_valid_srh(struct sk_buff *skb)
@@ -1036,6 +1183,16 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.optattrs	= SEG6_F_LOCAL_COUNTERS,
 		.input		= input_action_end_b6_encap,
 		.static_headroom	= sizeof(struct ipv6hdr),
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_B6_ETF,
+		.attrs		= SEG6_F_ATTR(SEG6_LOCAL_SRH),
+		.optattrs	= SEG6_F_LOCAL_COUNTERS,
+		.input		= input_action_end_b6_etf,
+		.static_headroom	= sizeof(struct ipv6hdr),
+		.slwt_ops	= {
+					.build_state = seg6_end_b6_etf_build,
+				  },
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_BPF,
